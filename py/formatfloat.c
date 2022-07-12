@@ -96,7 +96,7 @@ static inline int fp_isless1(float x) {
 #define fp_iszero(x) (x == 0)
 #define fp_isless1(x) (x < 1.0)
 
-#endif
+#endif // MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_FLOAT/DOUBLE
 
 static const FPTYPE g_pos_pow[] = {
     #if FPDECEXP > 32
@@ -258,18 +258,17 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
             }
         }
     } else {
-        // Build positive exponent
-        for (e = 0, e1 = FPDECEXP; e1; e1 >>= 1, pos_pow++, neg_pow++) {
-            if (*pos_pow <= f) {
+        // Build positive exponent.
+        // We don't modify f at this point to avoid innaccuracies from
+        // scaling it.  Instead, we find the product of powers of 10
+        // that is not greater than it, and use that to start the
+        // mantissa.
+        FPTYPE u_base = FPCONST(1.0);
+        for (e = 0, e1 = FPDECEXP; e1; e1 >>= 1, pos_pow++) {
+            if (f >= (u_base * *pos_pow)) {
                 e += e1;
-                f *= *neg_pow;
+                u_base *= *pos_pow;
             }
-        }
-
-        // It can be that f was right on the edge of an entry in pos_pow needs to be reduced
-        if ((int)f >= 10) {
-            e += 1;
-            f *= FPCONST(0.1);
         }
 
         // If the user specified fixed format (fmt == 'f') and e makes the
@@ -316,9 +315,15 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
         prec = 0;
     }
 
-    // We now have num.f as a floating point number between >= 1 and < 10
-    // (or equal to zero), and e contains the absolute value of the power of
-    // 10 exponent. and (dec + 1) == the number of dgits before the decimal.
+    // In the typical case, we now have num.f as a floating point number
+    // between >= 1 and < 10 (or equal to zero), and e contains the absolute
+    // value of the power of 10 exponent. and (dec + 1) == the number of dgits
+    // before the decimal.
+    //
+    // For f >= 10 we do NOT normalize f to avoid the small departures from
+    // whole numbers that scaling would incur.  Instead, we print the mantissa
+    // for the whole part by scaling up a floating-point base-10 unit, and
+    // repeated subtraction.
 
     // For e, prec is # digits after the decimal
     // For f, prec is # digits after the decimal
@@ -336,9 +341,52 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
         num_digits = prec;
     }
 
-    // Print the digits of the mantissa
-    for (int i = 0; i < num_digits; ++i, --dec) {
+    int num_digits_left = num_digits;
+    if (f >= FPCONST(10.0)) {
+        // Print any leading digits to bring f down to < 10.
+        for (int digit_index = e; digit_index > 0; --digit_index) {
+            // Generate 10^digit_index.
+            const FPTYPE *pos_pow_u = g_pos_pow;
+            FPTYPE u_base = FPCONST(1.0);
+            for (int m = FPDECEXP; m; m >>= 1, pos_pow_u++) {
+                if (m & digit_index) {
+                    u_base *= *pos_pow_u;
+                }
+            }
+            // Figure how many u_bases we can fit into f.
+            int d;
+            for (d = 0; d < 9; ++d) {
+                if (f < u_base) {
+                    break;
+                }
+                f -= u_base;
+            }
+            // Emit this number (the leading digit).
+            *s++ = '0' + d;
+            if (dec == 0 && prec > 0) {
+                *s++ = '.';
+            }
+            --dec;
+            --num_digits_left;
+            // Special-case the last digit.
+            if (num_digits_left <= 0) {
+                // We're going to fall through to the rounding code which
+                // expects f to be a residual in the range 1 <= f < 10, and
+                // will apply rounding if it's >= 5.  So now we need to
+                // construct that residual.
+                f = f * FPCONST(10.0) / u_base;
+                break;
+            }
+        }
+    }
+    // At this point, f is 0 or 1 <= f < 10.
+    // Print the remaining digits of the mantissa
+    for (int i = 0; i < num_digits_left; ++i, --dec) {
         int32_t d = (int32_t)f;
+        if (f > FPCONST(9.0)) {
+            // Sometimes f is too large because of rounding errors.
+            d = 9;
+        }
         if (d < 0) {
             *s++ = '0';
         } else {
@@ -394,7 +442,10 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
                 }
             } else {
                 // Need at extra digit at the end to make room for the leading '1'
-                s++;
+                // but if we're at the buffer size limit, just drop the final digit.
+                if ((size_t)(s + 1 - buf) < buf_size) {
+                    s++;
+                }
             }
             char *ss = s;
             while (ss > rs) {
