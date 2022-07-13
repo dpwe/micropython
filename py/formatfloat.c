@@ -25,6 +25,7 @@
  */
 
 #include "py/mpconfig.h"
+
 #if MICROPY_FLOAT_IMPL != MICROPY_FLOAT_IMPL_NONE
 
 #include <assert.h>
@@ -96,7 +97,7 @@ static inline int fp_isless1(float x) {
 #define fp_iszero(x) (x == 0)
 #define fp_isless1(x) (x < 1.0)
 
-#endif // MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_FLOAT/DOUBLE
+#endif
 
 static const FPTYPE g_pos_pow[] = {
     #if FPDECEXP > 32
@@ -167,12 +168,14 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
     if (fmt == 'g' && prec == 0) {
         prec = 1;
     }
-    int e, e1;
+    int e = 0, e1;
     int dec = 0;
     char e_sign = '\0';
     int num_digits = 0;
     const FPTYPE *pos_pow = g_pos_pow;
     const FPTYPE *neg_pow = g_neg_pow;
+    uint32_t f_int = 0;
+    uint32_t u_int = 1;
 
     if (fp_iszero(f)) {
         e = 0;
@@ -258,19 +261,47 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
             }
         }
     } else {
-        // Build positive exponent.
-        // We don't modify f at this point to avoid innaccuracies from
-        // scaling it.  Instead, we find the product of powers of 10
-        // that is not greater than it, and use that to start the
-        // mantissa.
-        FPTYPE u_base = FPCONST(1.0);
-        for (e = 0, e1 = FPDECEXP; e1; e1 >>= 1, pos_pow++) {
-            if (f >= (u_base * *pos_pow)) {
-                e += e1;
-                u_base *= *pos_pow;
+        // Build positive exponent
+
+        // First block is only for numbers that could be integers
+        // exactly-represented in float32.
+        if (f < FPCONST(4294967296.0)) {  // First number too big for uint32_t.
+            // In this case, we *won't* normalize f down to lie in
+            // 1 <= f < 10 because the repeated scaling by 0.1 cumulates
+            // errors in the representation, meaning numbers that start as
+            // integers become non-integers.  Instead, we work with the
+            // integer part of f (which will fit thanks to the test above).
+            // Setting f_int here will trigger the special handling later.
+            f_int = (uint32_t)f;
+            // We only allow u_int to go up to 10^9, since that's the largest
+            // power of 10 we can fit in a uint32_t.  Note, we *don't* compare
+            // against (u_int * 10), but wait until we go over and then
+            // backtrack. (u_int * 10) would overflow for the largest value.
+            for (int i = 0; i < 9; ++i) {
+                u_int *= 10;
+                ++e;
+                if (u_int > f_int) {
+                    u_int /= 10;
+                    --e;
+                    break;
+                }
+            }
+        } else {
+            // Calculate the exponent and normalize f to lie in the range
+            // 1 <= f < 10.
+            for (e = 0, e1 = FPDECEXP; e1; e1 >>= 1, pos_pow++, neg_pow++) {
+                if (*pos_pow <= f) {
+                    e += e1;
+                    f *= *neg_pow;
+                }
+            }
+            // It can be that f was right on the edge of an entry in pos_pow
+            // and needs to be reduced.
+            if ((int)f >= 10) {
+                e += 1;
+                f *= FPCONST(0.1);
             }
         }
-
         // If the user specified fixed format (fmt == 'f') and e makes the
         // number too big to fit into the available buffer, then we'll
         // switch to the 'e' format.
@@ -320,10 +351,10 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
     // value of the power of 10 exponent. and (dec + 1) == the number of dgits
     // before the decimal.
     //
-    // For f >= 10 we do NOT normalize f to avoid the small departures from
-    // whole numbers that scaling would incur.  Instead, we print the mantissa
-    // for the whole part by scaling up a floating-point base-10 unit, and
-    // repeated subtraction.
+    // For numbers in the range 10 <= f < 2^32 (which includes all whole-values
+    // that can be exactly represented in float32s), we do NOT normalize f
+    // to avoid the small departures from whole numbers that scaling would
+    // incur.
 
     // For e, prec is # digits after the decimal
     // For f, prec is # digits after the decimal
@@ -342,39 +373,34 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
     }
 
     int num_digits_left = num_digits;
-    if (f >= FPCONST(10.0)) {
+    // f_int has been set to the integer part of f if it's in the right range
+    // to use the resolution-preserving integer arithmetic for the integer
+    // part. u_int is set to the largest power of 10 not greater than f_int.
+    if (f_int) {
         // Print any leading digits to bring f down to < 10.
         for (int digit_index = e; digit_index > 0; --digit_index) {
-            // Generate 10^digit_index.
-            const FPTYPE *pos_pow_u = g_pos_pow;
-            FPTYPE u_base = FPCONST(1.0);
-            for (int m = FPDECEXP; m; m >>= 1, pos_pow_u++) {
-                if (m & digit_index) {
-                    u_base *= *pos_pow_u;
-                }
-            }
-            // Figure how many u_bases we can fit into f.
-            int d;
-            for (d = 0; d < 9; ++d) {
-                if (f < u_base) {
-                    break;
-                }
-                f -= u_base;
-            }
-            // Emit this number (the leading digit).
+            int d = f_int / u_int;  // (Integer division.)
+            f_int -= (d * u_int);
+            // We keep floating-point f in sync.  Subtracting whole values
+            // will not introduce rounding errors to exactly-represented
+            // whole values.
+            f -= (FPTYPE)(d * u_int);
             *s++ = '0' + d;
             if (dec == 0 && prec > 0) {
                 *s++ = '.';
             }
             --dec;
             --num_digits_left;
+            // Ready the "unit" for the next digit.  Integer division will
+            // avoid inaccuracies.
+            u_int /= 10;
             // Special-case the last digit.
-            if (num_digits_left <= 0) {
+            if (num_digits_left == 0) {
                 // We're going to fall through to the rounding code which
                 // expects f to be a residual in the range 1 <= f < 10, and
                 // will apply rounding if it's >= 5.  So now we need to
                 // construct that residual.
-                f = f * FPCONST(10.0) / u_base;
+                f *= (FPCONST(1.) / u_int);
                 break;
             }
         }
@@ -383,10 +409,6 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
     // Print the remaining digits of the mantissa
     for (int i = 0; i < num_digits_left; ++i, --dec) {
         int32_t d = (int32_t)f;
-        if (f > FPCONST(9.0)) {
-            // Sometimes f is too large because of rounding errors.
-            d = 9;
-        }
         if (d < 0) {
             *s++ = '0';
         } else {
@@ -442,10 +464,7 @@ int mp_format_float(FPTYPE f, char *buf, size_t buf_size, char fmt, int prec, ch
                 }
             } else {
                 // Need at extra digit at the end to make room for the leading '1'
-                // but if we're at the buffer size limit, just drop the final digit.
-                if ((size_t)(s + 1 - buf) < buf_size) {
-                    s++;
-                }
+                s++;
             }
             char *ss = s;
             while (ss > rs) {
